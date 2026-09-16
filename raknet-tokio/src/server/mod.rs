@@ -13,9 +13,10 @@ use raknet::prelude::{
 use state::{Initialized, Running};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::time::interval;
 use tracing::debug;
 
 pub struct RakServer {
@@ -89,8 +90,15 @@ impl RakServer {
                 let (dgram_tx, mut dgram_rx) = unbounded_channel::<(Box<[u8]>, SocketAddr)>();
                 let (disconnect_tx, mut disconnect_rx) = unbounded_channel::<RakSessionId>();
 
+                let mut update_interval = interval(Duration::from_secs(1));
+
                 loop {
                     tokio::select! {
+                        _ = update_interval.tick() => {
+                            let now = SystemTime::now();
+
+                            let _ = server.handle(RakServerInput::Update(now));
+                        }
                         Ok((len, addr)) = socket.recv_from(&mut buf) => {
                             let now = SystemTime::now();
 
@@ -103,7 +111,9 @@ impl RakServer {
                             let _ = socket.send_to(buf.as_ref(), addr).await;
                         }
                         Some(id) = disconnect_rx.recv() => {
-                            let _ = server.handle(RakServerInput::RemoveSession(id));
+                            let now = SystemTime::now();
+
+                            let _ = server.handle(RakServerInput::RemoveSession(id, now));
                             sessions.remove(&id);
                         }
                         Some(msg) = msg_rx.recv() => {
@@ -113,6 +123,15 @@ impl RakServer {
                                 },
                                 RakServerMsg::SetMaxConnections(n) => {
                                     let _ = server.handle(RakServerInput::SetMaxConnections(n));
+                                }
+                                RakServerMsg::Stop => {
+                                    let now = SystemTime::now();
+
+                                    for session in sessions.values() {
+                                        let _ = session.send(RakSessionInput::Disconnect(now));
+                                    }
+
+                                    break;
                                 }
                             }
                         }
@@ -161,15 +180,19 @@ impl RakServer {
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        let RakServerState::Running(Running { handle, .. }) = &self.state else {
+    pub async fn stop(&mut self) {
+        if !matches!(self.state, RakServerState::Running(_)) {
             return;
+        }
+
+        let RakServerState::Running(Running { handle, msg_tx, .. }) =
+            std::mem::replace(&mut self.state, RakServerState::Shutdown)
+        else {
+            unreachable!()
         };
 
-        // TODO
-        handle.abort();
-
-        self.state = RakServerState::Shutdown;
+        let _ = msg_tx.send(RakServerMsg::Stop);
+        let _ = handle.await;
     }
 
     pub async fn accept(&mut self) -> Result<RakSession, RakServerError> {

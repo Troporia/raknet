@@ -1,6 +1,5 @@
 pub const VALID: u8 = 0x80;
 pub const ACK: u8 = 0x40;
-pub const HAS_B_AND_AS: u8 = 0x20;
 pub const NACK: u8 = 0x20;
 pub const PAIR: u8 = 0x10;
 pub const SPLIT: u8 = 0x10;

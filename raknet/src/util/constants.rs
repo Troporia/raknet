@@ -12,9 +12,6 @@ pub const MAX_ORDERING_CHANNELS: i32 = 32;
 pub const PACKET_LIMIT: i32 = 120;
 pub const TOTAL_PACKET_LIMIT: i32 = 100_000;
 
-pub const SESSION_TIMEOUT_MS: i32 = 10_000;
-pub const SESSION_STALE_MS: i32 = 5_000;
-
 pub const CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(10_000);
 pub const CONNECTION_ATTEMPT_INTERVAL: Duration = Duration::from_millis(1_000);
 pub const CONNECTION_ATTEMPT_MAX: usize = 10;
@@ -24,7 +21,6 @@ pub const AUTOFLUSH_INTERVAL_MS: i32 = 10;
 
 pub const CC_MAX_THRESHOLD: i32 = 2000;
 pub const CC_ADDITIONAL_VARIANCE: i32 = 30;
-pub const CC_SYN: i32 = 10;
 
 pub const MAX_QUEUED_BYTES: i32 = 67_108_864;
 

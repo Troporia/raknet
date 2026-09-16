@@ -97,7 +97,7 @@ impl RakCodec for Ack {
                 if end < start {
                     return Err(RakCodecError::Malformed("ack range invalid, end < start"));
                 }
-                sequences.extend(start..end);
+                sequences.extend(start..=end);
             }
         }
 
@@ -128,5 +128,22 @@ impl RakCodec for Ack {
         size += Self::range_size_hint(start, end);
 
         size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_contiguous_range() {
+        let ack = Ack::new(vec![5, 6, 7], false);
+
+        let mut buf = Vec::with_capacity(ack.size_hint());
+        ack.serialize(&mut buf).unwrap();
+
+        let decoded = Ack::deserialize(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(decoded.sequences, vec![5, 6, 7]);
     }
 }

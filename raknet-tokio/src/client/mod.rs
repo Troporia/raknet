@@ -81,6 +81,7 @@ impl RakClient {
                         }
                         Some(_) = disconnect_rx.recv() => {
                             session_tx = None;
+                            let _ = client.handle(RakClientInput::Disconnect);
                         }
                         Some(msg) = msg_rx.recv() => {
                             let now = SystemTime::now();
@@ -94,6 +95,13 @@ impl RakClient {
                                     let _ = client.handle(RakClientInput::Connect(addr, now));
 
                                     connect = Some(sender);
+                                }
+                                RakClientMsg::Stop => {
+                                    if let Some(session) = &session_tx {
+                                        let _ = session.send(RakSessionInput::Disconnect(now));
+                                    }
+
+                                    break;
                                 }
                             }
                         }
@@ -135,15 +143,15 @@ impl RakClient {
                                 timer.as_mut().reset(Instant::now() + duration);
                             }
                             RakClientOutput::Pong(addr, msg, time) => {
-                                if let Some(queue) = pings.get_mut(&addr) {
-                                    if let Some((sender, ping_time)) = queue.pop_front() {
-                                        let _ = sender.send((
-                                            msg,
-                                            ping_time
-                                                .duration_since(time)
-                                                .unwrap_or(Duration::from_secs(0)),
-                                        ));
-                                    }
+                                if let Some(queue) = pings.get_mut(&addr)
+                                    && let Some((sender, ping_time)) = queue.pop_front()
+                                {
+                                    let _ = sender.send((
+                                        msg,
+                                        ping_time
+                                            .duration_since(time)
+                                            .unwrap_or(Duration::from_secs(0)),
+                                    ));
                                 }
                             }
                         }
@@ -156,15 +164,19 @@ impl RakClient {
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        let RakClientState::Running { handle, .. } = &self.state else {
+    pub async fn stop(&mut self) {
+        if !matches!(self.state, RakClientState::Running { .. }) {
             return;
+        }
+
+        let RakClientState::Running { handle, msg_tx } =
+            std::mem::replace(&mut self.state, RakClientState::Shutdown)
+        else {
+            unreachable!()
         };
 
-        // TODO
-        handle.abort();
-
-        self.state = RakClientState::Shutdown;
+        let _ = msg_tx.send(RakClientMsg::Stop);
+        let _ = handle.await;
     }
 
     pub async fn ping(&self, addr: SocketAddr) -> Result<(Box<[u8]>, Duration), RakClientError> {

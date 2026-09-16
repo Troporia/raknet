@@ -6,4 +6,5 @@ pub enum RakClientInput {
     Connect(SocketAddr, SystemTime),
     Datagram(Box<[u8]>, SocketAddr, SystemTime),
     Update(SystemTime),
+    Disconnect,
 }

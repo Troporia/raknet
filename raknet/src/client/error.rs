@@ -15,8 +15,8 @@ pub enum RakClientError {
     SecurityUnsupported,
     #[error("Connection Failed")]
     ConnectionFailed,
-    #[error("Connection Request Failed")]
-    ConnectionRequestFailed,
+    #[error("Connection Attempt Failed")]
+    ConnectionAttemptFailed,
     #[error("Incompatible Protocol")]
     IncompatibleProtocol,
     #[error("Already Connected")]

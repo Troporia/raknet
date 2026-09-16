@@ -6,4 +6,5 @@ use tokio::sync::oneshot;
 pub enum RakClientMsg {
     Connect(SocketAddr, oneshot::Sender<RakSession>),
     Ping(SocketAddr, oneshot::Sender<(Box<[u8]>, Duration)>),
+    Stop,
 }

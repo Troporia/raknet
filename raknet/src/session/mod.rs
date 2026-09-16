@@ -16,7 +16,7 @@ use crate::sans::Sans;
 use crate::session::congestion_controller::RakCongestionController;
 use crate::session::error::RakSessionError;
 use crate::session::input::RakSessionInput;
-use crate::session::output::RakSessionOutput;
+use crate::session::output::{RakDisconnectReason, RakSessionOutput};
 use crate::types::priority::RakPriority;
 use crate::types::reliability::RakReliability;
 use crate::util::constants::{DGRAM_HEADER_SIZE, DGRAM_MTU_OVERHEAD, UDP_HEADER_SIZE};
@@ -42,7 +42,7 @@ pub struct RakSession {
     pub id: RakSessionId,
     pub addr: SocketAddr,
     pub state: RakSessionState,
-    guid: u64,
+    pub guid: u64,
     mtu: u16,
     config: RakSessionConfig,
 
@@ -61,7 +61,7 @@ pub struct RakSession {
     outbound_seq: u32,
     outbound_spl: u16,
     outbound_rel: u32,
-    outbound_queue: VecDeque<Frame>,
+    outbound_queue: [VecDeque<Frame>; 4],
     outbound_cache: HashMap<u32, FrameSet>,
     outbound_resend: BinaryHeap<(Reverse<SystemTime>, u32)>,
     outbound_ord_idx: [u32; 32],
@@ -112,7 +112,9 @@ impl Sans for RakSession {
                 self.send_frame(Frame::new(reliability, buf), priority, now)?
             }
             RakSessionInput::Update(now) => self.handle_timeout(now)?,
-            RakSessionInput::Disconnect(now) => self.disconnect(true, now)?,
+            RakSessionInput::Disconnect(now) => {
+                self.disconnect(true, RakDisconnectReason::Requested, now)?
+            }
         }
         Ok(())
     }
@@ -156,7 +158,12 @@ impl RakSession {
             outbound_seq: 0,
             outbound_spl: 0,
             outbound_rel: 0,
-            outbound_queue: VecDeque::new(),
+            outbound_queue: [
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+            ],
             outbound_cache: HashMap::new(),
             outbound_resend: BinaryHeap::new(),
             outbound_ord_idx: [0; 32],
@@ -182,6 +189,10 @@ impl RakSession {
         self.state
     }
 
+    pub fn rtt(&self) -> Duration {
+        self.congestion_controller.rtt()
+    }
+
     fn handle_timeout(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
         if now >= self.last_recv + Duration::from_millis(15000) {
             debug!(
@@ -189,11 +200,11 @@ impl RakSession {
                 self.addr
             );
 
-            self.disconnect(true, now)?;
+            self.disconnect(true, RakDisconnectReason::Timeout, now)?;
             return Ok(());
         }
 
-        if now >= self.last_tick + Duration::from_millis(10) {
+        if self.config.autoflush && now >= self.last_tick + self.config.autoflush_interval_ms {
             self.tick(now)?;
 
             self.last_tick = now;
@@ -204,20 +215,24 @@ impl RakSession {
                 timestamp: now.duration_since(UNIX_EPOCH)?.as_millis() as u64,
             };
 
-            let mut buf = Vec::with_capacity(ConnectedPing::size_hint(&ping));
-            ConnectedPing::serialize(&ping, &mut buf)?;
+            let mut buf = Vec::with_capacity(ping.size_hint());
+            ping.serialize(&mut buf)?;
+            let buf = buf.into_boxed_slice();
+
+            let reliability = RakReliability::Unreliable;
+            let priority = RakPriority::Immediate;
+            self.handle(RakSessionInput::Send(buf, reliability, priority, now))?;
 
             self.last_ping = now;
         }
 
-        let next = [
-            self.last_tick + Duration::from_millis(10),
+        let mut next = min(
             self.last_ping + Duration::from_millis(2000),
             self.last_recv + Duration::from_millis(15000),
-        ]
-        .into_iter()
-        .min()
-        .expect("unreachable");
+        );
+        if self.config.autoflush {
+            next = min(next, self.last_tick + self.config.autoflush_interval_ms);
+        }
 
         let duration = next.duration_since(now).unwrap_or(Duration::from_secs(0));
 
@@ -279,6 +294,8 @@ impl RakSession {
 
             self.outbound_resend.pop();
 
+            self.congestion_controller.resent(seq);
+
             let set = self.outbound_cache.remove(&seq).expect("unreachable");
             pending.push(set);
         }
@@ -292,17 +309,13 @@ impl RakSession {
     fn send_queue(&mut self, now: SystemTime) -> Result<(), RakSessionError> {
         let mut bandwidth = self.congestion_controller.transmission_bandwidth();
 
-        let frames = {
-            let mut frames = Vec::new();
-            while let Some(frame) = self
-                .outbound_queue
-                .pop_front_if(|f| f.size_hint() <= bandwidth)
-            {
+        let mut frames = Vec::new();
+        for queue in &mut self.outbound_queue {
+            while let Some(frame) = queue.pop_front_if(|f| f.size_hint() <= bandwidth) {
                 bandwidth -= frame.size_hint();
                 frames.push(frame);
             }
-            frames
-        };
+        }
 
         if frames.is_empty() {
             return Ok(());
@@ -507,7 +520,7 @@ impl RakSession {
                     self.send_frame_set(set, true, now)?;
                 }
             }
-            _ => self.outbound_queue.extend(frames),
+            _ => self.outbound_queue[priority as usize].extend(frames),
         }
         Ok(())
     }
@@ -586,6 +599,17 @@ impl RakSession {
             return Ok(());
         }
 
+        let max_channels = (self.config.ordering_channels as usize).min(self.inbound_ord_idx.len());
+        if (frame.reliability.is_ordered() || frame.reliability.is_sequenced())
+            && frame.order_channel as usize >= max_channels
+        {
+            debug!(
+                "received frame with out of range order channel {} from {}",
+                frame.order_channel, self.addr
+            );
+            return Ok(());
+        }
+
         match frame.is_split() {
             true => self.handle_split_frame(frame, now)?,
             false => self.handle_full_frame(frame, now)?,
@@ -640,11 +664,7 @@ impl RakSession {
                         .inbound_ord_queue
                         .entry(frame.order_channel)
                         .or_default();
-                    loop {
-                        let Some(unord_frame) = unord_queue.remove(&idx) else {
-                            break;
-                        };
-
+                    while let Some(unord_frame) = unord_queue.remove(&idx) {
                         packets.push(unord_frame.payload);
 
                         idx += 1;
@@ -678,6 +698,29 @@ impl RakSession {
 
     fn handle_split_frame(&mut self, frame: Frame, now: SystemTime) -> Result<(), RakSessionError> {
         let mut frame = frame;
+
+        if frame.split_index >= frame.split_size {
+            debug!(
+                "received split frame with out of range index {} (size {}) from {}",
+                frame.split_index, frame.split_size, self.addr
+            );
+            return Ok(());
+        }
+
+        let queued: usize = self
+            .inbound_spl_queue
+            .values()
+            .flat_map(HashMap::values)
+            .map(|f| f.payload.len())
+            .sum();
+
+        if queued + frame.payload.len() > self.config.max_queued_bytes as usize {
+            debug!(
+                "dropping split frame from {}, buffered split bytes would exceed max_queued_bytes",
+                self.addr
+            );
+            return Ok(());
+        }
 
         let fragments = self.inbound_spl_queue.entry(frame.split_id).or_default();
         fragments.insert(frame.split_index, frame.clone());
@@ -764,11 +807,16 @@ impl RakSession {
 
         debug!("session closed by {}", self.addr);
 
-        self.disconnect(false, now)?;
+        self.disconnect(false, RakDisconnectReason::Remote, now)?;
         Ok(())
     }
 
-    fn disconnect(&mut self, send: bool, now: SystemTime) -> Result<(), RakSessionError> {
+    fn disconnect(
+        &mut self,
+        send: bool,
+        reason: RakDisconnectReason,
+        now: SystemTime,
+    ) -> Result<(), RakSessionError> {
         if matches!(self.state, RakSessionState::Disconnected) {
             return Err(RakSessionError::Closed);
         }
@@ -788,8 +836,143 @@ impl RakSession {
         self.state = RakSessionState::Disconnected;
 
         self.output
-            .push_back(RakSessionOutput::Disconnected(self.id));
+            .push_back(RakSessionOutput::Disconnected(self.id, reason));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_range_order_channel_does_not_panic() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |_| {},
+        );
+
+        let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([]));
+        frame.order_channel = u8::MAX;
+
+        session.handle_frame(frame, SystemTime::now()).unwrap();
+    }
+
+    #[test]
+    fn honors_configured_ordering_channels() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |conf| conf.ordering_channels = 4,
+        );
+
+        let mut frame = Frame::new(RakReliability::ReliableOrdered, Box::new([1]));
+        frame.order_channel = 4;
+
+        session.handle_frame(frame, SystemTime::now()).unwrap();
+
+        assert_eq!(session.inbound_ord_idx[4], 0);
+    }
+
+    #[test]
+    fn priority_routes_to_separate_queues() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |_| {},
+        );
+
+        let now = SystemTime::now();
+        session
+            .send_frame(
+                Frame::new(RakReliability::Unreliable, Box::new([1])),
+                RakPriority::Low,
+                now,
+            )
+            .unwrap();
+        session
+            .send_frame(
+                Frame::new(RakReliability::Unreliable, Box::new([2])),
+                RakPriority::High,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(session.outbound_queue[RakPriority::High as usize].len(), 1);
+        assert_eq!(session.outbound_queue[RakPriority::Low as usize].len(), 1);
+    }
+
+    #[test]
+    fn rejects_out_of_range_split_index() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |_| {},
+        );
+
+        let mut frame = Frame::new(RakReliability::Reliable, Box::new([1, 2, 3]));
+        frame.split_size = 2;
+        frame.split_index = 5;
+        frame.split_id = 1;
+
+        session.handle_frame(frame, SystemTime::now()).unwrap();
+
+        assert!(session.inbound_spl_queue.is_empty());
+    }
+
+    #[test]
+    fn drops_split_frame_exceeding_max_queued_bytes() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |conf| conf.max_queued_bytes = 4,
+        );
+
+        let mut frame = Frame::new(RakReliability::Reliable, vec![0u8; 8].into_boxed_slice());
+        frame.split_size = 2;
+        frame.split_index = 0;
+        frame.split_id = 1;
+
+        session.handle_frame(frame, SystemTime::now()).unwrap();
+
+        assert!(session.inbound_spl_queue.is_empty());
+    }
+
+    #[test]
+    fn disconnect_reason_matches_cause() {
+        let mut session = RakSession::new(
+            RakSessionId(0),
+            "127.0.0.1:19132".parse().unwrap(),
+            0,
+            crate::util::constants::MAX_MTU_SIZE,
+            |_| {},
+        );
+
+        session
+            .handle(RakSessionInput::Disconnect(SystemTime::now()))
+            .unwrap();
+
+        let reason = session
+            .output
+            .iter()
+            .find_map(|out| match out {
+                RakSessionOutput::Disconnected(_, reason) => Some(*reason),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(reason, RakDisconnectReason::Requested);
     }
 }

@@ -4,10 +4,13 @@ pub mod input;
 pub mod output;
 
 use crate::protocol::codec::RakCodec;
+use crate::protocol::packets::already_connected::AlreadyConnected;
 use crate::protocol::packets::connection_request::ConnectionRequest;
 use crate::protocol::packets::connection_request_accepted::ConnectionRequestAccepted;
 use crate::protocol::packets::incompatible_protocol::IncompatibleProtocol;
+use crate::protocol::packets::ip_recently_connected::IpRecentlyConnected;
 use crate::protocol::packets::new_incoming_connection::NewIncomingConnection;
+use crate::protocol::packets::no_free_incoming_connections::NoFreeIncomingConnections;
 use crate::protocol::packets::open_connection_reply_1::OpenConnectionReply1;
 use crate::protocol::packets::open_connection_reply_2::OpenConnectionReply2;
 use crate::protocol::packets::open_connection_request_1::OpenConnectionRequest1;
@@ -31,8 +34,12 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
+
+const RECENTLY_CONNECTED_COOLDOWN: Duration = Duration::from_millis(5000);
+const OFFLINE_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
+const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_millis(10_000);
 
 pub struct RakServer {
     addr: SocketAddr,
@@ -41,7 +48,12 @@ pub struct RakServer {
     session_id: RakSessionId,
     session_map: HashMap<SocketAddr, RakSessionId>,
     session_addr: HashMap<RakSessionId, SocketAddr>,
-    session_temp: HashMap<SocketAddr, RakSession>,
+    session_temp: HashMap<SocketAddr, (SystemTime, RakSession)>,
+    recently_disconnected: HashMap<SocketAddr, SystemTime>,
+
+    offline_window: SystemTime,
+    offline_total: i32,
+    offline_per_ip: HashMap<SocketAddr, i32>,
 
     output: VecDeque<RakServerOutput>,
 }
@@ -59,7 +71,7 @@ impl Sans for RakServer {
                 };
 
                 match header & flags::VALID {
-                    0 => self.handle_offline_datagram(&buf, addr)?,
+                    0 => self.handle_offline_datagram(&buf, addr, now)?,
                     _ => self.handle_online_datagram(buf, addr, now)?,
                 }
             }
@@ -69,12 +81,20 @@ impl Sans for RakServer {
             RakServerInput::SetMessage(msg) => {
                 self.config.message = msg;
             }
-            RakServerInput::RemoveSession(id) => {
+            RakServerInput::RemoveSession(id, now) => {
                 if let Some(addr) = self.session_addr.remove(&id) {
                     self.session_map.remove(&addr);
                     self.session_temp.remove(&addr);
+                    self.recently_disconnected.insert(addr, now);
                 }
+
+                self.recently_disconnected
+                    .retain(|_, &mut disconnected_at| {
+                        now.duration_since(disconnected_at).unwrap_or_default()
+                            < RECENTLY_CONNECTED_COOLDOWN
+                    });
             }
+            RakServerInput::Update(now) => self.evict_stale_temp_sessions(now),
         };
         Ok(())
     }
@@ -94,8 +114,52 @@ impl RakServer {
             session_map: HashMap::new(),
             session_addr: HashMap::new(),
             session_temp: HashMap::new(),
+            recently_disconnected: HashMap::new(),
+
+            offline_window: SystemTime::UNIX_EPOCH,
+            offline_total: 0,
+            offline_per_ip: HashMap::new(),
 
             output: VecDeque::new(),
+        }
+    }
+
+    fn rate_limited(&mut self, addr: SocketAddr, now: SystemTime) -> bool {
+        if now.duration_since(self.offline_window).unwrap_or_default() >= OFFLINE_RATE_LIMIT_WINDOW
+        {
+            self.offline_window = now;
+            self.offline_total = 0;
+            self.offline_per_ip.clear();
+        }
+
+        self.offline_total += 1;
+        if self.offline_total > self.config.total_packet_limit {
+            return true;
+        }
+
+        let count = self.offline_per_ip.entry(addr).or_insert(0);
+        *count += 1;
+
+        *count > self.config.packet_limit
+    }
+
+    fn evict_stale_temp_sessions(&mut self, now: SystemTime) {
+        let stale: Vec<SocketAddr> = self
+            .session_temp
+            .iter()
+            .filter(|(_, (created, _))| {
+                now.duration_since(*created).unwrap_or_default() >= PENDING_CONNECTION_TIMEOUT
+            })
+            .map(|(&addr, _)| addr)
+            .collect();
+
+        for addr in stale {
+            debug!("evicting stale pending connection from {}", addr);
+
+            self.session_temp.remove(&addr);
+            if let Some(id) = self.session_map.remove(&addr) {
+                self.session_addr.remove(&id);
+            }
         }
     }
 
@@ -103,16 +167,21 @@ impl RakServer {
         &mut self,
         buf: &[u8],
         addr: SocketAddr,
+        now: SystemTime,
     ) -> Result<(), RakServerError> {
+        if self.rate_limited(addr, now) {
+            return Ok(());
+        }
+
         if let Some(&id) = buf.first() {
             let mut cursor = Cursor::new(buf);
             match id {
                 packet_id::UNCONNECTED_PING => self.handle_unconnected_ping(&mut cursor, addr)?,
                 packet_id::OPEN_CONNECTION_REQUEST_1 => {
-                    self.handle_open_connection_request_1(&mut cursor, addr)?
+                    self.handle_open_connection_request_1(&mut cursor, addr, now)?
                 }
                 packet_id::OPEN_CONNECTION_REQUEST_2 => {
-                    self.handle_open_connection_request_2(&mut cursor, addr)?
+                    self.handle_open_connection_request_2(&mut cursor, addr, now)?
                 }
                 _ => debug!(
                     "received unknown offline packet from {}, id: {:#04X}",
@@ -132,7 +201,7 @@ impl RakServer {
         if let Entry::Occupied(mut entry) = self.session_temp.entry(addr) {
             let mut success = false;
 
-            let session = entry.get_mut();
+            let (_, session) = entry.get_mut();
 
             session.handle(RakSessionInput::Datagram(buf, now))?;
 
@@ -175,7 +244,7 @@ impl RakServer {
             }
 
             if success {
-                let session = entry.remove();
+                let (_, session) = entry.remove();
                 self.output
                     .push_back(RakServerOutput::SessionConnected(Box::new(session)));
             }
@@ -216,11 +285,12 @@ impl RakServer {
         &mut self,
         cursor: &mut Cursor<&[u8]>,
         addr: SocketAddr,
+        now: SystemTime,
     ) -> Result<(), RakServerError> {
         let request = OpenConnectionRequest1::deserialize(cursor)?;
 
         let req_protocol = request.protocol;
-        if req_protocol != constants::PROTOCOL {
+        if !self.config.protocols.contains(&req_protocol) {
             let incompatible = IncompatibleProtocol {
                 protocol: constants::PROTOCOL,
                 guid: self.config.guid,
@@ -235,6 +305,25 @@ impl RakServer {
 
             let mut buf = Vec::with_capacity(IncompatibleProtocol::size_hint(&incompatible));
             IncompatibleProtocol::serialize(&incompatible, &mut buf)?;
+            let buf = buf.into_boxed_slice();
+
+            self.output
+                .push_back(RakServerOutput::SocketDatagram(buf, addr));
+
+            return Ok(());
+        }
+
+        if let Some(&disconnected_at) = self.recently_disconnected.get(&addr)
+            && now.duration_since(disconnected_at).unwrap_or_default() < RECENTLY_CONNECTED_COOLDOWN
+        {
+            debug!("refusing connection from {} due to recent disconnect", addr);
+
+            let recent = IpRecentlyConnected {
+                guid: self.config.guid,
+            };
+
+            let mut buf = Vec::with_capacity(recent.size_hint());
+            recent.serialize(&mut buf)?;
             let buf = buf.into_boxed_slice();
 
             self.output
@@ -264,6 +353,7 @@ impl RakServer {
         &mut self,
         cursor: &mut Cursor<&[u8]>,
         addr: SocketAddr,
+        now: SystemTime,
     ) -> Result<(), RakServerError> {
         let request = OpenConnectionRequest2::deserialize(cursor)?;
 
@@ -284,10 +374,40 @@ impl RakServer {
         }
 
         if self.session_map.contains_key(&addr) {
-            return Err(RakServerError::RefusingConnection(format!(
+            debug!(
                 "refusing connection from {} due to existing connection",
                 addr
-            )));
+            );
+
+            let already = AlreadyConnected {
+                guid: self.config.guid,
+            };
+
+            let mut buf = Vec::with_capacity(already.size_hint());
+            already.serialize(&mut buf)?;
+            let buf = buf.into_boxed_slice();
+
+            self.output
+                .push_back(RakServerOutput::SocketDatagram(buf, addr));
+
+            return Ok(());
+        }
+
+        if self.session_map.len() >= self.config.max_connections {
+            debug!("refusing connection from {} due to max connections", addr);
+
+            let full = NoFreeIncomingConnections {
+                guid: self.config.guid,
+            };
+
+            let mut buf = Vec::with_capacity(full.size_hint());
+            full.serialize(&mut buf)?;
+            let buf = buf.into_boxed_slice();
+
+            self.output
+                .push_back(RakServerOutput::SocketDatagram(buf, addr));
+
+            return Ok(());
         }
 
         debug!(
@@ -309,9 +429,15 @@ impl RakServer {
 
         self.session_map.insert(addr, id);
         self.session_addr.insert(id, addr);
+        let max_ordering_channels = self.config.max_ordering_channels;
         self.session_temp.insert(
             addr,
-            RakSession::new(id, addr, request.client, request.mtu, |_| ()),
+            (
+                now,
+                RakSession::new(id, addr, request.client, request.mtu, |conf| {
+                    conf.ordering_channels = max_ordering_channels;
+                }),
+            ),
         );
         Ok(())
     }
@@ -356,5 +482,199 @@ impl RakServer {
         session.state = RakSessionState::Connected;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain(server: &mut RakServer) -> Vec<RakServerOutput> {
+        let mut out = Vec::new();
+        while let Some(o) = server.poll() {
+            out.push(o);
+        }
+        out
+    }
+
+    fn first_byte(output: &RakServerOutput) -> Option<u8> {
+        match output {
+            RakServerOutput::SocketDatagram(buf, _) => buf.first().copied(),
+            _ => None,
+        }
+    }
+
+    fn request_1(protocol: u8) -> Box<[u8]> {
+        let req = OpenConnectionRequest1 { protocol, mtu: 100 };
+        let mut buf = Vec::with_capacity(req.size_hint());
+        req.serialize(&mut buf).unwrap();
+        buf.into_boxed_slice()
+    }
+
+    fn request_2(server_addr: SocketAddr, client: u64) -> Box<[u8]> {
+        let req = OpenConnectionRequest2 {
+            cookie: None,
+            addr: server_addr,
+            mtu: constants::MIN_MTU_SIZE,
+            client,
+        };
+        let mut buf = Vec::with_capacity(req.size_hint());
+        req.serialize(&mut buf).unwrap();
+        buf.into_boxed_slice()
+    }
+
+    #[test]
+    fn rate_limits_offline_packets_per_ip() {
+        let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut server = RakServer::new(
+            RakServerConfig {
+                packet_limit: 2,
+                ..Default::default()
+            },
+            server_addr,
+        );
+
+        let ping = UnconnectedPing {
+            timestamp: 0,
+            client: 1,
+        };
+        let mut buf = Vec::with_capacity(ping.size_hint());
+        ping.serialize(&mut buf).unwrap();
+        let buf = buf.into_boxed_slice();
+
+        let now = SystemTime::now();
+        for _ in 0..5 {
+            server
+                .handle(RakServerInput::Datagram(buf.clone(), client_addr, now))
+                .unwrap();
+        }
+
+        assert_eq!(drain(&mut server).len(), 2);
+    }
+
+    #[test]
+    fn already_connected_reply_on_duplicate_request() {
+        let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut server = RakServer::new(RakServerConfig::default(), server_addr);
+        let now = SystemTime::now();
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_1(constants::PROTOCOL),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_2(server_addr, 1),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_2(server_addr, 1),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+
+        let outputs = drain(&mut server);
+        assert!(
+            outputs
+                .iter()
+                .any(|o| first_byte(o) == Some(packet_id::ALREADY_CONNECTED))
+        );
+    }
+
+    #[test]
+    fn ip_recently_connected_reply_after_disconnect() {
+        let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut server = RakServer::new(RakServerConfig::default(), server_addr);
+        let now = SystemTime::now();
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_1(constants::PROTOCOL),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_2(server_addr, 1),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        let id = *server.session_map.get(&client_addr).unwrap();
+        server
+            .handle(RakServerInput::RemoveSession(id, now))
+            .unwrap();
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_1(constants::PROTOCOL),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+
+        let outputs = drain(&mut server);
+        assert!(
+            outputs
+                .iter()
+                .any(|o| first_byte(o) == Some(packet_id::IP_RECENTLY_CONNECTED))
+        );
+    }
+
+    #[test]
+    fn evicts_stale_pending_connection() {
+        let server_addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let mut server = RakServer::new(RakServerConfig::default(), server_addr);
+        let now = SystemTime::now();
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_1(constants::PROTOCOL),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        server
+            .handle(RakServerInput::Datagram(
+                request_2(server_addr, 1),
+                client_addr,
+                now,
+            ))
+            .unwrap();
+        drain(&mut server);
+
+        assert!(server.session_temp.contains_key(&client_addr));
+
+        let later = now + PENDING_CONNECTION_TIMEOUT;
+        server.handle(RakServerInput::Update(later)).unwrap();
+
+        assert!(!server.session_temp.contains_key(&client_addr));
+        assert!(!server.session_map.contains_key(&client_addr));
     }
 }

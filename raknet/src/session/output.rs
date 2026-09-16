@@ -6,6 +6,13 @@ use std::time::Duration;
 pub enum RakSessionOutput {
     Packet(Box<[u8]>),
     Datagram(Box<[u8]>, SocketAddr),
-    Disconnected(RakSessionId),
+    Disconnected(RakSessionId, RakDisconnectReason),
     Wait(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RakDisconnectReason {
+    Requested,
+    Timeout,
+    Remote,
 }

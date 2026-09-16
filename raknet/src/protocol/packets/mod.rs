@@ -1,4 +1,5 @@
 pub mod ack;
+pub mod already_connected;
 pub mod connected_ping;
 pub mod connected_pong;
 pub mod connection_request;
@@ -6,7 +7,9 @@ pub mod connection_request_accepted;
 pub mod disconnect;
 pub mod frame_set;
 pub mod incompatible_protocol;
+pub mod ip_recently_connected;
 pub mod new_incoming_connection;
+pub mod no_free_incoming_connections;
 pub mod open_connection_reply_1;
 pub mod open_connection_reply_2;
 pub mod open_connection_request_1;

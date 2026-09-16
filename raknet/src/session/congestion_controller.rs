@@ -89,7 +89,11 @@ impl RakCongestionController {
 
     pub fn acked(&mut self, now: SystemTime, seq: u32, size: usize, last_sequence: u32) {
         if let Some(sent_at) = self.sent_times.remove(&seq) {
-            let rtt_ms = now.duration_since(sent_at).unwrap().as_secs_f64() * 1000.0;
+            let rtt_ms = now
+                .duration_since(sent_at)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0;
             self.bytes_not_acknowledged -= size;
 
             if self.rtt_estimate_ms.is_infinite() {

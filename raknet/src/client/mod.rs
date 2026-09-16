@@ -24,7 +24,8 @@ use crate::protocol::packets::unconnected_ping::UnconnectedPing;
 use crate::protocol::packets::unconnected_pong::UnconnectedPong;
 use crate::sans::Sans;
 use crate::session::RakSessionId;
-use crate::util::packet_id;
+use crate::util::{constants, packet_id};
+use std::cmp::min;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -41,6 +42,7 @@ pub struct RakClient {
     cookie: Option<i32>,
     session: Option<RakSession>,
 
+    connect_started: SystemTime,
     last_attempt: SystemTime,
 
     output: VecDeque<RakClientOutput>,
@@ -77,6 +79,7 @@ impl Sans for RakClient {
 
                 self.state = RakClientState::Handshake1(remote);
                 self.attempts = 0;
+                self.connect_started = now;
                 self.last_attempt = now
                     .checked_sub(self.config.conn_attempt_interval)
                     .unwrap_or(now);
@@ -112,7 +115,7 @@ impl Sans for RakClient {
                                                     )?;
                                                     success = Some(true);
                                                 }
-                                                packet_id::CONNECTION_REQUEST_FAILED => {
+                                                packet_id::CONNECTION_ATTEMPT_FAILED => {
                                                     session
                                                         .handle(RakSessionInput::Disconnect(now))?;
                                                     success = Some(false);
@@ -141,8 +144,8 @@ impl Sans for RakClient {
                                 .output
                                 .push_back(RakClientOutput::SessionConnected(Box::new(session))),
                             false => {
-                                debug!("connection request failed");
-                                return Err(RakClientError::ConnectionRequestFailed);
+                                debug!("connection attempt failed");
+                                return Err(RakClientError::ConnectionAttemptFailed);
                             }
                         }
                     }
@@ -150,17 +153,14 @@ impl Sans for RakClient {
                 RakClientState::Unconnected => {
                     if let Some(&b) = buf.first() {
                         let mut cursor = Cursor::new(buf.as_ref());
-                        match b {
-                            packet_id::UNCONNECTED_PONG => {
-                                let pong = UnconnectedPong::deserialize(&mut cursor)?;
+                        if b == packet_id::UNCONNECTED_PONG {
+                            let pong = UnconnectedPong::deserialize(&mut cursor)?;
 
-                                self.output.push_back(RakClientOutput::Pong(
-                                    addr,
-                                    pong.message,
-                                    UNIX_EPOCH + Duration::from_millis(pong.timestamp),
-                                ))
-                            }
-                            _ => {}
+                            self.output.push_back(RakClientOutput::Pong(
+                                addr,
+                                pong.message,
+                                UNIX_EPOCH + Duration::from_millis(pong.timestamp),
+                            ))
                         }
                     }
                 }
@@ -208,6 +208,10 @@ impl Sans for RakClient {
                 }
             },
             RakClientInput::Update(now) => self.handle_timeout(now)?,
+            RakClientInput::Disconnect => {
+                self.state = RakClientState::Unconnected;
+                self.session = None;
+            }
         }
         Ok(())
     }
@@ -226,6 +230,7 @@ impl RakClient {
             mtu: 0,
             cookie: None,
             session: None,
+            connect_started: SystemTime::now(),
             last_attempt: SystemTime::now(),
             output: VecDeque::new(),
         }
@@ -239,6 +244,14 @@ impl RakClient {
             return Ok(());
         }
 
+        if now >= self.connect_started + self.config.conn_attempt_timeout {
+            debug!(
+                "RakClient connection failed after {:?}",
+                self.config.conn_attempt_timeout
+            );
+            return Err(RakClientError::ConnectionFailed);
+        }
+
         if now >= self.last_attempt + self.config.conn_attempt_interval {
             if self.attempts < self.config.conn_attempt_max {
                 match self.state {
@@ -248,7 +261,9 @@ impl RakClient {
                         self.last_attempt = now;
                     }
                     RakClientState::Handshake2(addr) => {
-                        self.send_open_connection_request_2(addr)?
+                        self.send_open_connection_request_2(addr)?;
+                        self.attempts += 1;
+                        self.last_attempt = now;
                     }
                     _ => {}
                 }
@@ -261,7 +276,10 @@ impl RakClient {
             }
         }
 
-        let next = self.last_attempt + self.config.conn_attempt_interval;
+        let next = min(
+            self.last_attempt + self.config.conn_attempt_interval,
+            self.connect_started + self.config.conn_attempt_timeout,
+        );
 
         let duration = next.duration_since(now).unwrap_or(Duration::from_secs(0));
 
@@ -271,11 +289,9 @@ impl RakClient {
     }
 
     fn send_open_connection_request_1(&mut self, addr: SocketAddr) -> Result<(), RakClientError> {
-        let steps = self.config.conn_attempt_max.saturating_sub(1).max(1);
-        let mtu = self.config.min_mtu_size
-            + (((self.config.max_mtu_size - self.config.min_mtu_size) as usize
-                * self.attempts.min(steps))
-                / steps) as u16;
+        let index = self.attempts.min(constants::MTU_SIZES.len() - 1);
+        let mtu = constants::MTU_SIZES[constants::MTU_SIZES.len() - 1 - index]
+            .clamp(self.config.min_mtu_size, self.config.max_mtu_size);
 
         let req = OpenConnectionRequest1 {
             protocol: self.config.protocol,
@@ -368,11 +384,9 @@ impl RakClient {
         ))?;
 
         while let Some(msg) = session.poll() {
-            match msg {
-                RakSessionOutput::Datagram(buf, addr) => self
-                    .output
-                    .push_back(RakClientOutput::SocketDatagram(buf, addr)),
-                _ => {}
+            if let RakSessionOutput::Datagram(buf, addr) = msg {
+                self.output
+                    .push_back(RakClientOutput::SocketDatagram(buf, addr))
             }
         }
 
@@ -413,5 +427,83 @@ impl RakClient {
         ))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn last_datagram_len(client: &mut RakClient) -> u16 {
+        let mut len = 0;
+        while let Some(RakClientOutput::SocketDatagram(buf, _)) = client.poll() {
+            len = buf.len() as u16;
+        }
+        len
+    }
+
+    #[test]
+    fn mtu_negotiation_starts_high_and_shrinks() {
+        let mut client = RakClient::new(RakClientConfig::default());
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+
+        client.attempts = 0;
+        client.send_open_connection_request_1(addr).unwrap();
+        assert_eq!(last_datagram_len(&mut client), constants::MAX_MTU_SIZE);
+
+        client.attempts = 1;
+        client.send_open_connection_request_1(addr).unwrap();
+        assert_eq!(last_datagram_len(&mut client), 1200);
+
+        client.attempts = 2;
+        client.send_open_connection_request_1(addr).unwrap();
+        assert_eq!(last_datagram_len(&mut client), constants::MIN_MTU_SIZE);
+
+        client.attempts = 9;
+        client.send_open_connection_request_1(addr).unwrap();
+        assert_eq!(last_datagram_len(&mut client), constants::MIN_MTU_SIZE);
+    }
+
+    #[test]
+    fn overall_connect_timeout_fails_regardless_of_attempts() {
+        let mut client = RakClient::new(RakClientConfig {
+            conn_attempt_timeout: Duration::from_millis(100),
+            conn_attempt_interval: Duration::from_millis(1000),
+            conn_attempt_max: 100,
+            ..RakClientConfig::default()
+        });
+
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+        let start = SystemTime::now();
+
+        client.handle(RakClientInput::Connect(addr, start)).unwrap();
+
+        let result = client.handle(RakClientInput::Update(start + Duration::from_millis(200)));
+
+        assert!(matches!(result, Err(RakClientError::ConnectionFailed)));
+    }
+
+    #[test]
+    fn disconnect_input_allows_reconnect() {
+        let mut client = RakClient::new(RakClientConfig::default());
+        let addr: SocketAddr = "127.0.0.1:19132".parse().unwrap();
+
+        client.state = RakClientState::HandshakeCompleted(addr);
+
+        client
+            .handle(RakClientInput::Connect(addr, SystemTime::now()))
+            .unwrap();
+        assert!(matches!(
+            client.state,
+            RakClientState::HandshakeCompleted(_)
+        ));
+
+        client.handle(RakClientInput::Disconnect).unwrap();
+        assert!(matches!(client.state, RakClientState::Unconnected));
+
+        client
+            .handle(RakClientInput::Connect(addr, SystemTime::now()))
+            .unwrap();
+        assert!(matches!(client.state, RakClientState::Handshake1(_)));
     }
 }

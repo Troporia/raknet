@@ -6,5 +6,6 @@ pub enum RakServerInput {
     SetMessage(Box<[u8]>),
     SetMaxConnections(usize),
     Datagram(Box<[u8]>, SocketAddr, SystemTime),
-    RemoveSession(RakSessionId),
+    RemoveSession(RakSessionId, SystemTime),
+    Update(SystemTime),
 }

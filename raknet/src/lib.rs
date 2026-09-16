@@ -17,8 +17,12 @@ pub mod prelude {
         output::RakServerOutput,
     };
     pub use crate::session::{
-        RakSession, RakSessionId, config::RakSessionConfig, error::RakSessionError,
-        input::RakSessionInput, output::RakSessionOutput, state::RakSessionState,
+        RakSession, RakSessionId,
+        config::RakSessionConfig,
+        error::RakSessionError,
+        input::RakSessionInput,
+        output::{RakDisconnectReason, RakSessionOutput},
+        state::RakSessionState,
     };
     pub use crate::types::*;
 }
