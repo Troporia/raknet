@@ -3,7 +3,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RakCongestionController {
     mtu: usize,
 
@@ -17,6 +17,7 @@ pub struct RakCongestionController {
 
     bytes_not_acknowledged: usize,
 
+    #[serde(with = "crate::util::serde_time::map")]
     sent_times: HashMap<u32, SystemTime>,
 }
 

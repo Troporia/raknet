@@ -32,12 +32,12 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-#[derive(Default, Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+#[derive(Default, Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RakSessionId(pub u64);
 
 const RELIABLE_WINDOW: usize = 8192;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RakSession {
     pub id: RakSessionId,
     pub addr: SocketAddr,
@@ -46,9 +46,13 @@ pub struct RakSession {
     mtu: u16,
     config: RakSessionConfig,
 
+    #[serde(with = "crate::util::serde_time")]
     last_tick: SystemTime,
+    #[serde(with = "crate::util::serde_time")]
     last_ping: SystemTime,
+    #[serde(with = "crate::util::serde_time")]
     last_recv: SystemTime,
+    #[serde(with = "crate::util::serde_time")]
     last_pong: SystemTime,
 
     congestion_controller: RakCongestionController,
@@ -60,9 +64,10 @@ pub struct RakSession {
 
     outbound_seq: u32,
     outbound_spl: u16,
-    outbound_rel: u32,
+    pub(crate) outbound_rel: u32,
     outbound_queue: [VecDeque<Frame>; 4],
     outbound_cache: HashMap<u32, FrameSet>,
+    #[serde(with = "outbound_resend_serde")]
     outbound_resend: BinaryHeap<(Reverse<SystemTime>, u32)>,
     outbound_ord_idx: [u32; 32],
     outbound_seq_idx: [u32; 32],
@@ -75,7 +80,45 @@ pub struct RakSession {
     inbound_ord_idx: [u32; 32],
     inbound_seq_idx: [u32; 32],
 
+    /// Pending emitted events (bytes to send, decoded packets ready to poll) - not
+    /// protocol identity, and a handoff should only ever be initiated after draining
+    /// this to empty via `poll()`, so it's never meaningful to carry across a
+    /// serialize/deserialize round trip.
+    #[serde(skip, default)]
     output: VecDeque<RakSessionOutput>,
+}
+
+/// `BinaryHeap` needs `Ord`, but `(Reverse<SystemTime>, u32)` can't derive it without
+/// `SystemTime` itself being `Ord`-serializable through serde - round-trip it as a
+/// plain `Vec` of millis-since-epoch pairs instead, rebuilding heap order on import.
+mod outbound_resend_serde {
+    use super::*;
+    use crate::util::serde_time;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        heap: &BinaryHeap<(Reverse<SystemTime>, u32)>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Entry(#[serde(with = "serde_time")] SystemTime, u32);
+
+        let entries: Vec<Entry> = heap.iter().map(|(t, seq)| Entry(t.0, *seq)).collect();
+        entries.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BinaryHeap<(Reverse<SystemTime>, u32)>, D::Error> {
+        #[derive(Deserialize)]
+        struct Entry(#[serde(with = "serde_time")] SystemTime, u32);
+
+        let entries = Vec::<Entry>::deserialize(d)?;
+        Ok(entries
+            .into_iter()
+            .map(|Entry(t, seq)| (Reverse(t), seq))
+            .collect())
+    }
 }
 
 impl Sans for RakSession {
@@ -845,6 +888,68 @@ impl RakSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The actual claim behind session export/import: a session that has
+    /// done real protocol work (advanced sequence counters, queued a resend) can
+    /// be serialized, sent through an arbitrary byte format, deserialized back
+    /// into a fresh `RakSession` value, and continue exactly where it left off -
+    /// not reset to a blank session with the same id.
+    #[test]
+    fn exported_state_round_trips_through_serde_and_resumes_where_it_left_off() {
+        let mut session = RakSession::new(
+            RakSessionId(42),
+            "127.0.0.1:19132".parse().unwrap(),
+            0xDEAD_BEEF,
+            crate::util::constants::MAX_MTU_SIZE,
+            |_| {},
+        );
+
+        let now = SystemTime::now();
+        session
+            .handle(RakSessionInput::Send(
+                Box::from(*b"hello"),
+                RakReliability::ReliableOrdered,
+                RakPriority::Immediate,
+                now,
+            ))
+            .unwrap();
+        while session.poll().is_some() {}
+
+        let before_seq = session.outbound_rel;
+        assert!(before_seq > 0, "sending a reliable frame should advance outbound_rel");
+
+        // A real handoff uses a compact binary format, not JSON - which also sidesteps
+        // JSON's inability to represent the f64::INFINITY the congestion controller
+        // starts with before any round trip completes (bincode round-trips IEEE-754
+        // bit patterns exactly, JSON would coerce it to `null` and fail to decode).
+        let bytes = bincode::serde::encode_to_vec(&session, bincode::config::standard())
+            .expect("session must serialize");
+        let (mut resumed, _): (RakSession, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("session must deserialize");
+
+        assert_eq!(resumed.id, session.id);
+        assert_eq!(resumed.addr, session.addr);
+        assert_eq!(resumed.guid, session.guid);
+        assert_eq!(resumed.outbound_rel, before_seq);
+        assert!(
+            resumed.output.is_empty(),
+            "pending output is never meaningful across a handoff, not part of protocol identity"
+        );
+
+        // And it isn't just data that looks right - the resumed session must still
+        // be usable: sending another reliable frame continues counting up, not
+        // restarting from 0 as a fresh session would.
+        resumed
+            .handle(RakSessionInput::Send(
+                Box::from(*b"world"),
+                RakReliability::ReliableOrdered,
+                RakPriority::Immediate,
+                now,
+            ))
+            .unwrap();
+        assert_eq!(resumed.outbound_rel, before_seq + 1);
+    }
 
     #[test]
     fn out_of_range_order_channel_does_not_panic() {

@@ -55,6 +55,9 @@ impl RakSession {
                                 let closed = matches!(session.get_state(), RakSessionState::Disconnected);
                                 let _ = sender.send(closed);
                             },
+                            RakSessionMsg::ExportState(sender) => {
+                                let _ = sender.send(session.clone());
+                            },
                         }
                     }
                     Some(recv) = rx.recv() => {
@@ -144,5 +147,23 @@ impl RakSession {
 
     pub fn get_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Snapshot this session's live protocol state (sequence/ack counters, frame
+    /// queues, congestion state, MTU, encryption is NOT included - that's a Bedrock-
+    /// layer concern, handled separately above this crate). The returned
+    /// `RakSessionIntl` is `Serialize`/`Deserialize` and can be shipped to a
+    /// different process, then resumed there via [`RakSession::spawn`] with the
+    /// deserialized value in place of a freshly-`accept()`-ed session. The live task
+    /// backing `self` keeps running unaffected - it's the caller's job (as part of
+    /// the actual handoff protocol) to stop feeding it further input and shut it
+    /// down once the target confirms it has taken over, so the two copies don't
+    /// keep diverging in parallel.
+    pub async fn export_state(&self) -> Result<RakSessionIntl, RakSessionError> {
+        let (tx, rx) = oneshot::channel();
+        self.msg_tx
+            .send(RakSessionMsg::ExportState(tx))
+            .map_err(|_| RakSessionError::Closed)?;
+        rx.await.map_err(|_| RakSessionError::Closed)
     }
 }

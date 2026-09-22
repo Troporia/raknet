@@ -7,8 +7,8 @@ use crate::server::msg::RakServerMsg;
 use crate::server::state::RakServerState;
 use crate::session::RakSession;
 use raknet::prelude::{
-    RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput, RakSessionId,
-    RakSessionInput, Sans,
+    RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput,
+    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, Sans,
 };
 use state::{Initialized, Running};
 use std::collections::HashMap;
@@ -124,6 +124,22 @@ impl RakServer {
                                 RakServerMsg::SetMaxConnections(n) => {
                                     let _ = server.handle(RakServerInput::SetMaxConnections(n));
                                 }
+                                RakServerMsg::AdoptSession(session, reply) => {
+                                    server.adopt_session(session);
+
+                                    if let Some(RakServerOutput::SessionConnected(session)) = server.poll() {
+                                        let id = session.id;
+
+                                        let (session, tx) = RakSession::spawn(
+                                            *session,
+                                            dgram_tx.clone(),
+                                            disconnect_tx.clone(),
+                                        );
+
+                                        sessions.insert(id, tx);
+                                        let _ = reply.send(session);
+                                    }
+                                }
                                 RakServerMsg::Stop => {
                                     let now = SystemTime::now();
 
@@ -193,6 +209,24 @@ impl RakServer {
 
         let _ = msg_tx.send(RakServerMsg::Stop);
         let _ = handle.await;
+    }
+
+    /// See core `RakServer::adopt_session` - hands a session exported from another
+    /// `RakServer` instance (via `RakSession::export_state()`) to this one, and returns
+    /// the resumed session handle directly (not via `accept()` - see `RakServerMsg::
+    /// AdoptSession`'s doc comment for why).
+    pub async fn adopt_session(&mut self, session: RakSessionIntl) -> Result<RakSession, RakServerError> {
+        let RakServerState::Running(Running { msg_tx, .. }) = &self.state else {
+            return Err(RakServerError::Closed);
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        msg_tx
+            .send(RakServerMsg::AdoptSession(session, tx))
+            .map_err(|_| RakServerError::Closed)?;
+
+        rx.await.map_err(|_| RakServerError::Closed)
     }
 
     pub async fn accept(&mut self) -> Result<RakSession, RakServerError> {

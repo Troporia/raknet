@@ -124,6 +124,33 @@ impl RakServer {
         }
     }
 
+    /// Adopts a session exported from another `RakServer` instance (see
+    /// `RakSession::export_state`/`clone()` and its round-trip test in `session/mod.rs`)
+    /// - the cross-process handoff primitive: the session's protocol state (sequence/ack
+    /// counters, MTU, congestion state, frame reassembly buffers) continues exactly where
+    /// it left off, no new RakNet handshake with the peer.
+    ///
+    /// Mints a FRESH local `RakSessionId` rather than reusing the exported one - the two
+    /// servers' id counters are independent, so the exported id could already be in use
+    /// here. Registers the session for datagram routing exactly like a freshly-handshaked
+    /// connection (`handle_online_datagram`'s promotion path above) and emits it as a
+    /// `SessionConnected` output, so it shows up through the normal `poll()`/`accept()`
+    /// path indistinguishably from one this server handshaked itself - the caller (the
+    /// tokio wrapper) doesn't need a separate code path to pick it up.
+    pub fn adopt_session(&mut self, mut session: RakSession) {
+        let id = self.session_id;
+        self.session_id.0 += 1;
+
+        let addr = session.addr;
+        session.id = id;
+
+        self.session_map.insert(addr, id);
+        self.session_addr.insert(id, addr);
+
+        self.output
+            .push_back(RakServerOutput::SessionConnected(Box::new(session)));
+    }
+
     fn rate_limited(&mut self, addr: SocketAddr, now: SystemTime) -> bool {
         if now.duration_since(self.offline_window).unwrap_or_default() >= OFFLINE_RATE_LIMIT_WINDOW
         {
@@ -640,6 +667,78 @@ mod tests {
             outputs
                 .iter()
                 .any(|o| first_byte(o) == Some(packet_id::IP_RECENTLY_CONNECTED))
+        );
+    }
+
+    /// The actual claim `adopt_session` depends on: a session that completed its
+    /// handshake and exchanged real traffic on one `RakServer` (proving genuine
+    /// protocol-advanced state, not a freshly-constructed one) can be handed to a
+    /// SECOND, independent `RakServer` instance and continue being routed correctly -
+    /// the primitive a live cross-process session handoff depends on (see
+    /// `raknet_tokio::server::RakServer::adopt_session` and `RakSession::export_state`).
+    #[test]
+    fn adopted_session_continues_on_a_second_server() {
+        let peer_addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        // Server A: a session that has actually exchanged a reliable frame, so its
+        // sequence/ack state has genuinely advanced past its initial values - the same
+        // shape of proof raknet-tokio's own export/import round-trip test relies on.
+        let mut server_a = RakServer::new(RakServerConfig::default(), "127.0.0.1:19160".parse().unwrap());
+        let id_on_a = RakSessionId(7);
+        server_a.session_map.insert(peer_addr, id_on_a);
+        server_a.session_addr.insert(id_on_a, peer_addr);
+
+        let mut session = RakSession::new(id_on_a, peer_addr, 0xDEAD_BEEF, constants::MAX_MTU_SIZE, |_| {});
+        let now = SystemTime::now();
+        session
+            .handle(RakSessionInput::Send(
+                b"hello".to_vec().into_boxed_slice(),
+                RakReliability::ReliableOrdered,
+                RakPriority::Immediate,
+                now,
+            ))
+            .unwrap();
+        let before_seq = session.outbound_rel;
+        assert!(before_seq > 0, "sending a reliable frame must advance the sequence counter");
+
+        // Server B: an entirely separate instance, with its OWN session id counter
+        // already past what Server A was using - proves adopt_session mints a fresh id
+        // rather than trusting the exported one, which could otherwise collide.
+        let mut server_b = RakServer::new(RakServerConfig::default(), "127.0.0.1:19161".parse().unwrap());
+        server_b.session_id = RakSessionId(id_on_a.0 + 100);
+
+        server_b.adopt_session(session);
+
+        let outputs = drain(&mut server_b);
+        let adopted = outputs.into_iter().find_map(|o| match o {
+            RakServerOutput::SessionConnected(session) => Some(*session),
+            _ => None,
+        });
+        let adopted = adopted.expect("adopt_session must emit SessionConnected");
+
+        assert_eq!(adopted.outbound_rel, before_seq, "sequence state must carry over unchanged");
+        assert_ne!(adopted.id, id_on_a, "a colliding id from another server must not be reused as-is");
+        assert_eq!(
+            *server_b.session_map.get(&peer_addr).unwrap(),
+            adopted.id,
+            "future datagrams from the peer must route to the adopted session's new id"
+        );
+
+        // A subsequent datagram from the peer's address must now route to the adopted
+        // session on Server B, exactly as if it had been connected here all along.
+        server_b
+            .handle(RakServerInput::Datagram(
+                b"\xffnoise".to_vec().into_boxed_slice(),
+                peer_addr,
+                now,
+            ))
+            .unwrap();
+        let routed = drain(&mut server_b);
+        assert!(
+            routed
+                .iter()
+                .any(|o| matches!(o, RakServerOutput::SessionDatagram(_, id) if *id == adopted.id)),
+            "a datagram from the adopted session's peer must be routed by its new id"
         );
     }
 
