@@ -8,7 +8,7 @@ use crate::server::state::RakServerState;
 use crate::session::RakSession;
 use raknet::prelude::{
     RakServer as RakServerIntl, RakServerConfig, RakServerInput, RakServerOutput,
-    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, Sans,
+    RakSession as RakSessionIntl, RakSessionId, RakSessionInput, RakSessionSnapshot, Sans,
 };
 use state::{Initialized, Running};
 use std::collections::HashMap;
@@ -124,8 +124,8 @@ impl RakServer {
                                 RakServerMsg::SetMaxConnections(n) => {
                                     let _ = server.handle(RakServerInput::SetMaxConnections(n));
                                 }
-                                RakServerMsg::AdoptSession(session, reply) => {
-                                    server.adopt_session(session);
+                                RakServerMsg::Adopt(session, reply) => {
+                                    server.adopt(session);
 
                                     if let Some(RakServerOutput::SessionConnected(session)) = server.poll() {
                                         let id = session.id;
@@ -211,19 +211,21 @@ impl RakServer {
         let _ = handle.await;
     }
 
-    /// See core `RakServer::adopt_session` - hands a session exported from another
-    /// `RakServer` instance (via `RakSession::export_state()`) to this one, and returns
-    /// the resumed session handle directly (not via `accept()` - see `RakServerMsg::
-    /// AdoptSession`'s doc comment for why).
-    pub async fn adopt_session(&mut self, session: RakSessionIntl) -> Result<RakSession, RakServerError> {
+    /// Resumes a session captured with [`crate::session::RakSession::snapshot`] on
+    /// another server, returning its handle here.
+    pub async fn adopt(
+        &mut self,
+        snapshot: RakSessionSnapshot,
+    ) -> Result<RakSession, RakServerError> {
         let RakServerState::Running(Running { msg_tx, .. }) = &self.state else {
             return Err(RakServerError::Closed);
         };
 
+        let session = RakSessionIntl::restore(snapshot)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         msg_tx
-            .send(RakServerMsg::AdoptSession(session, tx))
+            .send(RakServerMsg::Adopt(session, tx))
             .map_err(|_| RakServerError::Closed)?;
 
         rx.await.map_err(|_| RakServerError::Closed)

@@ -5,7 +5,7 @@ use crate::util::flags::SPLIT;
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, facet::Facet)]
 pub struct Frame {
     pub reliability: RakReliability,
     pub payload: Box<[u8]>,

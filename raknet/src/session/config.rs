@@ -3,7 +3,7 @@ use crate::util::constants::{
 };
 use std::time::Duration;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, facet::Facet)]
 pub struct RakSessionConfig {
     pub ordering_channels: i32,
     pub autoflush: bool,

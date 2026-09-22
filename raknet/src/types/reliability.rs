@@ -1,4 +1,4 @@
-#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, facet::Facet)]
 #[repr(u8)]
 pub enum RakReliability {
     Unreliable,
